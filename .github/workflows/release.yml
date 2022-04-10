@@ -44,4 +44,4 @@ jobs:
         with:
           name: my-artifact
           path: |
-            solana-accountsdb-plugin-kafka-release-*
+            solana-accountsdb-plugin-kafka-release-*.tar.bz2
