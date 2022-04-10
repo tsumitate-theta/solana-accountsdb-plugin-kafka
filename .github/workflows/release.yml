@@ -39,13 +39,9 @@ jobs:
       - name: Build release tarball
         run: ./ci/create-tarball.sh
 
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload
+        uses: actions/upload-artifact@v2
         with:
-          body: |
-            solana-accountsdb-plugin-kafka ${{ env.CI_TAG }}
-            solana ${{ env.SOLANA_VERSION }}
-            rust ${{ env.RUST_STABLE }}
-          files: |
+          name: my-artifact
+          path: |
             solana-accountsdb-plugin-kafka-release-*
