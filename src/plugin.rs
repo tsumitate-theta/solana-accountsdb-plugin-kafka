@@ -13,23 +13,30 @@
 // limitations under the License.
 
 use {
-    crate::*,
-    log::info,
-    rdkafka::util::get_rdkafka_version,
-    simple_error::simple_error,
-    solana_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPlugin, GeyserPluginError as PluginError, ReplicaAccountInfoV2,
-        ReplicaAccountInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
-        SlotStatus as PluginSlotStatus,
+    crate::{
+        sanitized_message, CompiledInstruction, Config, Filter, InnerInstruction,
+        InnerInstructions, LegacyLoadedMessage, LegacyMessage, LoadedAddresses,
+        MessageAddressTableLookup, MessageHeader, PrometheusService, Publisher, Reward,
+        SanitizedMessage, SanitizedTransaction, SlotStatus, SlotStatusEvent, TransactionEvent,
+        TransactionStatusMeta, TransactionTokenBalance, UiTokenAmount, UpdateAccountEvent,
+        V0LoadedMessage, V0Message,
     },
+    log::{debug, error, info, log_enabled},
+    rdkafka::util::get_rdkafka_version,
+    solana_geyser_plugin_interface::geyser_plugin_interface::{
+        GeyserPlugin, GeyserPluginError as PluginError, ReplicaAccountInfoV3,
+        ReplicaAccountInfoVersions, ReplicaTransactionInfoV2, ReplicaTransactionInfoVersions,
+        Result as PluginResult, SlotStatus as PluginSlotStatus,
+    },
+    solana_program::pubkey::Pubkey,
     std::fmt::{Debug, Formatter},
 };
 
 #[derive(Default)]
 pub struct KafkaPlugin {
     publisher: Option<Publisher>,
-    filter: Option<Filter>,
-    publish_all_accounts: bool,
+    filter: Option<Vec<Filter>>,
+    prometheus: Option<PrometheusService>,
 }
 
 impl Debug for KafkaPlugin {
@@ -45,8 +52,7 @@ impl GeyserPlugin for KafkaPlugin {
 
     fn on_load(&mut self, config_file: &str) -> PluginResult<()> {
         if self.publisher.is_some() {
-            let err = simple_error!("plugin already loaded");
-            return Err(PluginError::Custom(Box::new(err)));
+            return Err(PluginError::Custom("plugin already loaded".into()));
         }
 
         solana_logger::setup_with_default("info");
@@ -56,19 +62,23 @@ impl GeyserPlugin for KafkaPlugin {
             config_file
         );
         let config = Config::read_from(config_file)?;
-        self.publish_all_accounts = config.publish_all_accounts;
 
         let (version_n, version_s) = get_rdkafka_version();
         info!("rd_kafka_version: {:#08x}, {}", version_n, version_s);
 
-        let producer = config
-            .producer()
-            .map_err(|e| PluginError::Custom(Box::new(e)))?;
+        let producer = config.producer().map_err(|error| {
+            error!("Failed to create kafka producer: {error:?}");
+            PluginError::Custom(Box::new(error))
+        })?;
         info!("Created rdkafka::FutureProducer");
 
         let publisher = Publisher::new(producer, &config);
+        let prometheus = config
+            .create_prometheus()
+            .map_err(|error| PluginError::Custom(Box::new(error)))?;
         self.publisher = Some(publisher);
-        self.filter = Some(Filter::new(&config));
+        self.filter = Some(config.filters.iter().map(Filter::new).collect());
+        self.prometheus = prometheus;
         info!("Spawned producer");
 
         Ok(())
@@ -77,86 +87,129 @@ impl GeyserPlugin for KafkaPlugin {
     fn on_unload(&mut self) {
         self.publisher = None;
         self.filter = None;
+        if let Some(prometheus) = self.prometheus.take() {
+            prometheus.shutdown();
+        }
     }
 
     fn update_account(
-        &mut self,
+        &self,
         account: ReplicaAccountInfoVersions,
         slot: u64,
         is_startup: bool,
     ) -> PluginResult<()> {
-        if is_startup && !self.publish_all_accounts {
+        let filters = self.unwrap_filters();
+        if is_startup && filters.iter().all(|filter| !filter.publish_all_accounts) {
             return Ok(());
         }
 
         let info = Self::unwrap_update_account(account);
-        if !self.unwrap_filter().wants_program(info.owner) {
-            return Ok(());
+        let publisher = self.unwrap_publisher();
+        for filter in filters {
+            if !filter.update_account_topic.is_empty() {
+                if !filter.wants_program(info.owner) && !filter.wants_account(info.pubkey) {
+                    Self::log_ignore_account_update(info);
+                    continue;
+                }
+
+                let event = UpdateAccountEvent {
+                    slot,
+                    pubkey: info.pubkey.to_vec(),
+                    lamports: info.lamports,
+                    owner: info.owner.to_vec(),
+                    executable: info.executable,
+                    rent_epoch: info.rent_epoch,
+                    data: info.data.to_vec(),
+                    write_version: info.write_version,
+                    txn_signature: info.txn.map(|v| v.signature().as_ref().to_owned()),
+                };
+
+                publisher
+                    .update_account(event, filter.wrap_messages, &filter.update_account_topic)
+                    .map_err(|e| PluginError::AccountsUpdateError { msg: e.to_string() })?;
+            }
         }
 
-        let event = UpdateAccountEvent {
-            slot,
-            pubkey: info.pubkey.to_vec(),
-            lamports: info.lamports,
-            owner: info.owner.to_vec(),
-            executable: info.executable,
-            rent_epoch: info.rent_epoch,
-            data: info.data.to_vec(),
-            write_version: info.write_version,
-            txn_signature: info.txn_signature.map(|sig| sig.as_ref().to_owned()),
-        };
-
-        let publisher = self.unwrap_publisher();
-        publisher
-            .update_account(event)
-            .map_err(|e| PluginError::AccountsUpdateError { msg: e.to_string() })
+        Ok(())
     }
 
     fn update_slot_status(
-        &mut self,
+        &self,
         slot: u64,
         parent: Option<u64>,
         status: PluginSlotStatus,
     ) -> PluginResult<()> {
         let publisher = self.unwrap_publisher();
-        if !publisher.wants_slot_status() {
-            return Ok(());
+        for filter in self.unwrap_filters() {
+            if !filter.slot_status_topic.is_empty() {
+                let event = SlotStatusEvent {
+                    slot,
+                    parent: parent.unwrap_or(0),
+                    status: SlotStatus::from(status).into(),
+                };
+
+                publisher
+                    .update_slot_status(event, filter.wrap_messages, &filter.slot_status_topic)
+                    .map_err(|e| PluginError::AccountsUpdateError { msg: e.to_string() })?;
+            }
         }
 
-        let event = SlotStatusEvent {
-            slot,
-            parent: parent.unwrap_or(0),
-            status: SlotStatus::from(status).into(),
-        };
-
-        publisher
-            .update_slot_status(event)
-            .map_err(|e| PluginError::AccountsUpdateError { msg: e.to_string() })
+        Ok(())
     }
 
     fn notify_transaction(
-        &mut self,
+        &self,
         transaction: ReplicaTransactionInfoVersions,
         slot: u64,
     ) -> PluginResult<()> {
+        let info = Self::unwrap_transaction(transaction);
         let publisher = self.unwrap_publisher();
-        if !publisher.wants_transaction() {
-            return Ok(());
+        for filter in self.unwrap_filters() {
+            if !filter.transaction_topic.is_empty() {
+                let is_failed = info.transaction_status_meta.status.is_err();
+                if (!filter.wants_vote_tx() && info.is_vote)
+                    || (!filter.wants_failed_tx() && is_failed)
+                {
+                    debug!("Ignoring vote/failed transaction");
+                    continue;
+                }
+
+                if !info
+                    .transaction
+                    .message()
+                    .account_keys()
+                    .iter()
+                    .any(|pubkey| {
+                        filter.wants_program(pubkey.as_ref())
+                            || filter.wants_account(pubkey.as_ref())
+                    })
+                {
+                    debug!("Ignoring transaction {:?}", info.signature);
+                    continue;
+                }
+
+                let event = Self::build_transaction_event(slot, info);
+                publisher
+                    .update_transaction(event, filter.wrap_messages, &filter.transaction_topic)
+                    .map_err(|e| PluginError::TransactionUpdateError { msg: e.to_string() })?;
+            }
         }
 
-        let event = Self::build_transaction_event(slot, transaction);
-
-        publisher
-            .update_transaction(event)
-            .map_err(|e| PluginError::TransactionUpdateError { msg: e.to_string() })
+        Ok(())
     }
 
     fn account_data_notifications_enabled(&self) -> bool {
-        self.unwrap_publisher().wants_update_account()
+        let filters = self.unwrap_filters();
+        filters
+            .iter()
+            .any(|filter| !filter.update_account_topic.is_empty())
     }
 
     fn transaction_notifications_enabled(&self) -> bool {
-        self.unwrap_publisher().wants_transaction()
+        let filters = self.unwrap_filters();
+        filters
+            .iter()
+            .any(|filter| !filter.transaction_topic.is_empty())
     }
 }
 
@@ -169,16 +222,30 @@ impl KafkaPlugin {
         self.publisher.as_ref().expect("publisher is unavailable")
     }
 
-    fn unwrap_filter(&self) -> &Filter {
+    fn unwrap_filters(&self) -> &Vec<Filter> {
         self.filter.as_ref().expect("filter is unavailable")
     }
 
-    fn unwrap_update_account(account: ReplicaAccountInfoVersions) -> &ReplicaAccountInfoV2 {
+    fn unwrap_update_account(account: ReplicaAccountInfoVersions) -> &ReplicaAccountInfoV3 {
         match account {
             ReplicaAccountInfoVersions::V0_0_1(_info) => {
                 panic!("ReplicaAccountInfoVersions::V0_0_1 unsupported, please upgrade your Solana node.");
             }
-            ReplicaAccountInfoVersions::V0_0_2(info) => info,
+            ReplicaAccountInfoVersions::V0_0_2(_info) => {
+                panic!("ReplicaAccountInfoVersions::V0_0_2 unsupported, please upgrade your Solana node.");
+            }
+            ReplicaAccountInfoVersions::V0_0_3(info) => info,
+        }
+    }
+
+    fn unwrap_transaction(
+        transaction: ReplicaTransactionInfoVersions,
+    ) -> &ReplicaTransactionInfoV2 {
+        match transaction {
+            ReplicaTransactionInfoVersions::V0_0_1(_info) => {
+                panic!("ReplicaTransactionInfoVersions::V0_0_1 unsupported, please upgrade your Solana node.");
+            }
+            ReplicaTransactionInfoVersions::V0_0_2(info) => info,
         }
     }
 
@@ -189,6 +256,15 @@ impl KafkaPlugin {
             program_id_index: ix.program_id_index as u32,
             accounts: ix.clone().accounts.into_iter().map(|v| v as u32).collect(),
             data: ix.data.clone(),
+        }
+    }
+
+    fn build_inner_instruction(
+        ix: &solana_transaction_status::InnerInstruction,
+    ) -> InnerInstruction {
+        InnerInstruction {
+            instruction: Some(Self::build_compiled_instruction(&ix.instruction)),
+            stack_height: ix.stack_height,
         }
     }
 
@@ -220,20 +296,18 @@ impl KafkaPlugin {
 
     fn build_transaction_event(
         slot: u64,
-        transaction: ReplicaTransactionInfoVersions,
-    ) -> TransactionEvent {
-        let transaction = if let ReplicaTransactionInfoVersions::V0_0_2(transaction) = transaction {
-            transaction
-        } else {
-            panic!("Unsupported ReplicaTransactionInfoVersions::V0_0_2, please upgrade your Solana node.")
-        };
-        let transaction_status_meta = transaction.transaction_status_meta;
-        let signature = transaction.signature;
-        let is_vote = transaction.is_vote;
-        let transaction = transaction.transaction;
-        TransactionEvent {
+        ReplicaTransactionInfoV2 {
+            signature,
             is_vote,
+            transaction,
+            transaction_status_meta,
+            index,
+        }: &ReplicaTransactionInfoV2,
+    ) -> TransactionEvent {
+        TransactionEvent {
+            is_vote: *is_vote,
             slot,
+            index: *index as u64,
             signature: signature.as_ref().into(),
             transaction_status_meta: Some(TransactionStatusMeta {
                 is_status_err: transaction_status_meta.status.is_err(),
@@ -266,19 +340,19 @@ impl KafkaPlugin {
                     None => vec![],
                 },
                 inner_instructions: match &transaction_status_meta.inner_instructions {
-                    None => vec![],
                     Some(inners) => inners
                         .clone()
                         .into_iter()
-                        .map(|inner| InnerInstruction {
+                        .map(|inner| InnerInstructions {
                             index: inner.index as u32,
                             instructions: inner
                                 .instructions
                                 .iter()
-                                .map(Self::build_compiled_instruction)
+                                .map(Self::build_inner_instruction)
                                 .collect(),
                         })
                         .collect(),
+                    None => vec![],
                 },
                 pre_balances: transaction_status_meta.pre_balances.clone(),
                 post_balances: transaction_status_meta.post_balances.clone(),
@@ -305,22 +379,27 @@ impl KafkaPlugin {
                 message: Some(SanitizedMessage {
                     message_payload: Some(match transaction.message() {
                         solana_program::message::SanitizedMessage::Legacy(lv) => {
-                            sanitized_message::MessagePayload::Legacy(LegacyMessage {
-                                header: Some(Self::build_message_header(&lv.message.header)),
-                                account_keys: lv
-                                    .message
-                                    .account_keys
-                                    .clone()
-                                    .into_iter()
-                                    .map(|k| k.as_ref().into())
+                            sanitized_message::MessagePayload::Legacy(LegacyLoadedMessage {
+                                message: Some(LegacyMessage {
+                                    header: Some(Self::build_message_header(&lv.message.header)),
+                                    account_keys: lv
+                                        .message
+                                        .account_keys
+                                        .clone()
+                                        .into_iter()
+                                        .map(|k| k.as_ref().into())
+                                        .collect(),
+                                    instructions: lv
+                                        .message
+                                        .instructions
+                                        .iter()
+                                        .map(Self::build_compiled_instruction)
+                                        .collect(),
+                                    recent_block_hash: lv.message.recent_blockhash.as_ref().into(),
+                                }),
+                                is_writable_account_cache: (0..(lv.account_keys().len() - 1))
+                                    .map(|i: usize| lv.is_writable(i))
                                     .collect(),
-                                instructions: lv
-                                    .message
-                                    .instructions
-                                    .iter()
-                                    .map(Self::build_compiled_instruction)
-                                    .collect(),
-                                recent_block_hash: lv.message.recent_blockhash.as_ref().into(),
                             })
                         }
                         solana_program::message::SanitizedMessage::V0(v0) => {
@@ -377,6 +456,9 @@ impl KafkaPlugin {
                                         .map(|x| x.as_ref().into())
                                         .collect(),
                                 }),
+                                is_writable_account_cache: (0..(v0.account_keys().len() - 1))
+                                    .map(|i: usize| v0.is_writable(i))
+                                    .collect(),
                             })
                         }
                     }),
@@ -388,6 +470,19 @@ impl KafkaPlugin {
                     .map(|x| x.as_ref().into())
                     .collect(),
             }),
+        }
+    }
+
+    fn log_ignore_account_update(info: &ReplicaAccountInfoV3) {
+        if log_enabled!(::log::Level::Debug) {
+            match <&[u8; 32]>::try_from(info.owner) {
+                Ok(key) => debug!(
+                    "Ignoring update for account key: {:?}",
+                    Pubkey::new_from_array(*key)
+                ),
+                // Err should never happen because wants_account_key only returns false if the input is &[u8; 32]
+                Err(_err) => debug!("Ignoring update for account key: {:?}", info.owner),
+            };
         }
     }
 }
